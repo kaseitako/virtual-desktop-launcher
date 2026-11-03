@@ -34,9 +34,12 @@ function Wait-ExplorerReady {
         [int]$TimeoutSeconds = 30
     )
 
+    $sessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
     $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([datetime]::UtcNow -lt $deadline) {
-        if ($null -ne (Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        if ($null -ne (Get-Process -Name explorer -ErrorAction SilentlyContinue |
+                Where-Object SessionId -eq $sessionId |
+                Select-Object -First 1)) {
             return $true
         }
         Start-Sleep -Milliseconds 200
@@ -45,14 +48,8 @@ function Wait-ExplorerReady {
     return $false
 }
 
-# 設定ファイルとログ出力先を決定する
-$resolvedSettingsPath = Resolve-StartupPath -Path $SettingsPath -DefaultPath (Join-Path $PSScriptRoot 'virtual-desktop-setting.json')
-$resolvedLogDirectory = Resolve-StartupPath -Path $LogDirectory -DefaultPath (Join-Path $PSScriptRoot 'logs')
-$null = New-Item -ItemType Directory -Path $resolvedLogDirectory -Force
-$logFilePath = Join-Path $resolvedLogDirectory ("startup-virtual-desktop-{0}-{1}.jsonl" -f [datetime]::Now.ToString('yyyyMMdd-HHmmss'), $PID)
-
 # 1 行 1 JSON 形式で実行ログを記録する
-$loggerLogFilePath = $logFilePath
+$loggerLogFilePath = $null
 $logger = {
     param($Level, $Message, $Data)
 
@@ -64,7 +61,7 @@ $logger = {
     }
     $line = $entry | ConvertTo-Json -Depth 12 -Compress
     $null = Add-Content -LiteralPath $loggerLogFilePath -Value $line -Encoding utf8
-}.GetNewClosure()
+}
 
 # 二重起動を防止する
 $mutex = $null
@@ -72,15 +69,25 @@ $ownsMutex = $false
 $exitCode = 2
 
 try {
+    # 設定ファイルとログ出力先を決定する
+    $resolvedSettingsPath = Resolve-StartupPath -Path $SettingsPath -DefaultPath (Join-Path $PSScriptRoot 'virtual-desktop-setting.json')
+    $resolvedLogDirectory = Resolve-StartupPath -Path $LogDirectory -DefaultPath (Join-Path $PSScriptRoot 'logs')
+    $null = New-Item -ItemType Directory -Path $resolvedLogDirectory -Force
+    $logFilePath = Join-Path $resolvedLogDirectory ("startup-virtual-desktop-{0}-{1}.jsonl" -f [datetime]::Now.ToString('yyyyMMdd-HHmmss'), $PID)
+    $loggerLogFilePath = $logFilePath
+    $logger = $logger.GetNewClosure()
+
     $mutexUser = [regex]::Replace([Environment]::UserName, '[^A-Za-z0-9_.-]', '_')
     $mutex = [System.Threading.Mutex]::new($false, "Local\StartupVirtualDesktop-$mutexUser")
     try {
-        $ownsMutex = $mutex.WaitOne(0, $false)
+        if (-not $ValidateOnly) {
+            $ownsMutex = $mutex.WaitOne(0, $false)
+        }
     } catch [System.Threading.AbandonedMutexException] {
         $ownsMutex = $true
     }
 
-    if (-not $ownsMutex) {
+    if (-not $ValidateOnly -and -not $ownsMutex) {
         & $logger 'Warning' '別の仮想デスクトップ起動処理が既に実行中です。' $null
         Write-Warning '別の仮想デスクトップ起動処理が既に実行中のため、この処理を終了します。'
         $exitCode = 0
@@ -99,7 +106,12 @@ try {
             throw "設定ファイル '$resolvedSettingsPath' が存在しません。"
         }
 
-        $rawSettings = Get-Content -LiteralPath $resolvedSettingsPath -Raw -Encoding utf8 | ConvertFrom-Json -Depth 100
+        $settingsJson = Get-Content -LiteralPath $resolvedSettingsPath -Raw -Encoding utf8
+        $schemaPath = Join-Path $PSScriptRoot 'virtual-desktop-setting.schema.json'
+        if (-not (Test-Json -Json $settingsJson -SchemaFile $schemaPath -ErrorAction Stop)) {
+            throw '設定ファイルが JSON Schema に適合していません。'
+        }
+        $rawSettings = ConvertFrom-Json -InputObject $settingsJson -Depth 100
         $settings = ConvertTo-DesktopLayoutSettings -InputObject $rawSettings
         $null = Test-DesktopLayoutSettings -Settings $settings
         foreach ($warning in @($settings.warnings)) {
@@ -124,6 +136,9 @@ try {
             Write-Output "設定の検証に成功しました: $resolvedSettingsPath"
             $exitCode = 0
         } else {
+            if (-not $IsWindows) {
+                throw 'アプリの起動と配置は Windows の対話セッションで実行してください。'
+            }
             if ([string]::IsNullOrWhiteSpace($diagnostics.VirtualDesktopModuleVersion) -or
                 [version]$diagnostics.VirtualDesktopModuleVersion -lt [version]'1.5.9') {
                 throw 'VirtualDesktop モジュール 1.5.9 以降が必要です。Install-Module VirtualDesktop -Scope CurrentUser を実行してください。'

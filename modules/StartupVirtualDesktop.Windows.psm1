@@ -93,6 +93,7 @@ namespace StartupVirtualDesktop
 function Get-VisibleTopLevelWindows {
     Initialize-StartupVirtualDesktopWindowApi
     $windows = [System.Collections.Generic.List[object]]::new()
+    $processNames = @{}
 
     foreach ($handle in [StartupVirtualDesktop.NativeWindow]::EnumerateVisibleTopLevel()) {
         $processId = [StartupVirtualDesktop.NativeWindow]::GetProcessId($handle)
@@ -101,13 +102,24 @@ function Get-VisibleTopLevelWindows {
         }
 
         try {
-            $process = Get-Process -Id $processId -ErrorAction Stop
+            $className = [StartupVirtualDesktop.NativeWindow]::GetClass($handle)
+            if ($className -in @('Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd')) {
+                continue
+            }
+            if (-not $processNames.ContainsKey($processId)) {
+                $process = Get-Process -Id $processId -ErrorAction Stop
+                try {
+                    $processNames[$processId] = $process.ProcessName
+                } finally {
+                    $process.Dispose()
+                }
+            }
             $windows.Add([pscustomobject]@{
                 Handle = [long]$handle
                 ProcessId = $processId
-                ProcessName = $process.ProcessName
+                ProcessName = $processNames[$processId]
                 Title = [StartupVirtualDesktop.NativeWindow]::GetTitle($handle)
-                ClassName = [StartupVirtualDesktop.NativeWindow]::GetClass($handle)
+                ClassName = $className
             })
         } catch {
             continue
@@ -124,13 +136,20 @@ function Get-DesktopShortcutMetadata {
     )
 
     $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($Path)
-    $targetPath = [string]$shortcut.TargetPath
-
-    return [pscustomobject]@{
-        targetPath = $targetPath
-        preferredTitle = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-        trackStartedProcess = -not [string]::IsNullOrWhiteSpace($targetPath)
+    $shortcut = $null
+    try {
+        $shortcut = $shell.CreateShortcut($Path)
+        $targetPath = [string]$shortcut.TargetPath
+        return [pscustomobject]@{
+            targetPath = $targetPath
+            preferredTitle = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+            trackStartedProcess = -not [string]::IsNullOrWhiteSpace($targetPath)
+        }
+    } finally {
+        if ($null -ne $shortcut) {
+            $null = [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+        }
+        $null = [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
     }
 }
 
@@ -141,6 +160,17 @@ function Resolve-DesktopApplication {
     )
 
     $configuredPath = [Environment]::ExpandEnvironmentVariables([string]$App.path)
+    $baseDirectory = Split-Path $PSScriptRoot -Parent
+    if (-not [System.IO.Path]::IsPathRooted($configuredPath)) {
+        $candidate = Join-Path $baseDirectory $configuredPath
+        if ($configuredPath -match '[/\\]' -or (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            $configuredPath = [System.IO.Path]::GetFullPath($candidate)
+        }
+    }
+    $workingDirectory = [Environment]::ExpandEnvironmentVariables([string]$App.workingDirectory)
+    if (-not [string]::IsNullOrWhiteSpace($workingDirectory) -and -not [System.IO.Path]::IsPathRooted($workingDirectory)) {
+        $workingDirectory = [System.IO.Path]::GetFullPath((Join-Path $baseDirectory $workingDirectory))
+    }
     $launchPath = $configuredPath
     $inferredProcessName = [System.IO.Path]::GetFileNameWithoutExtension($configuredPath)
     $preferredTitle = ''
@@ -169,7 +199,7 @@ function Resolve-DesktopApplication {
         path = $App.path
         launchPath = $launchPath
         arguments = @($App.arguments)
-        workingDirectory = $App.workingDirectory
+        workingDirectory = $workingDirectory
         timeoutSeconds = $App.timeoutSeconds
         onExisting = $App.onExisting
         maximized = $App.maximized
@@ -179,6 +209,22 @@ function Resolve-DesktopApplication {
         trackStartedProcess = $trackStartedProcess
         startedProcessId = 0
     }
+}
+
+function ConvertTo-WindowsCommandLine {
+    param(
+        [AllowEmptyCollection()]
+        [string[]]$Arguments = @()
+    )
+
+    # Start-Process joins ArgumentList with spaces; quote each logical argument.
+    # Double backslashes before a quote and before the closing quote (Windows CRT rules).
+    $quoted = foreach ($argument in $Arguments) {
+        $escaped = [regex]::Replace($argument, '(\\*)"', '$1$1\"')
+        $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+        '"' + $escaped + '"'
+    }
+    return $quoted -join ' '
 }
 
 function Start-DesktopApplication {
@@ -200,15 +246,21 @@ function Start-DesktopApplication {
         $options.PassThru = $true
     }
     if (@($App.arguments).Count -gt 0) {
-        $options.ArgumentList = @($App.arguments)
+        $options.ArgumentList = ConvertTo-WindowsCommandLine -Arguments @($App.arguments)
     }
     if (-not [string]::IsNullOrWhiteSpace($App.workingDirectory)) {
         $options.WorkingDirectory = $App.workingDirectory
     }
 
     $process = Start-Process @options
-    return [pscustomobject]@{
-        ProcessId = if ($trackStartedProcess -and $null -ne $process) { $process.Id } else { 0 }
+    try {
+        return [pscustomobject]@{
+            ProcessId = if ($trackStartedProcess -and $null -ne $process) { $process.Id } else { 0 }
+        }
+    } finally {
+        if ($process -is [System.Diagnostics.Process]) {
+            $process.Dispose()
+        }
     }
 }
 
@@ -242,6 +294,10 @@ function New-WindowsDesktopAdapter {
         }
         SetWallpaper = {
             param($Desktop, $Path)
+            $Path = [Environment]::ExpandEnvironmentVariables($Path)
+            if (-not [System.IO.Path]::IsPathRooted($Path)) {
+                throw "Wallpaper path '$Path' must be absolute."
+            }
             if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
                 throw "Wallpaper file '$Path' does not exist."
             }

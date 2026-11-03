@@ -164,13 +164,36 @@ Describe 'Get-WindowMatchScore' {
         Get-WindowMatchScore -Window $script:window -App $script:app -NewHandles @{} -ExcludedHandles @{ 42 = $true } | Should Be -1
     }
 
-    It 'allows a new launcher window whose process name differs' {
+    It 'rejects an unrelated new window even when its handle is new' {
         $script:app.inferredProcessName = 'LineLauncher'
         $script:window.ProcessName = 'LINE'
 
         $newScore = Get-WindowMatchScore -Window $script:window -App $script:app -NewHandles @{ 42 = $true } -ExcludedHandles @{}
 
-        $newScore | Should BeGreaterThan 0
+        $newScore | Should Be -1
+    }
+
+    It 'accepts the started process even when its name differs from the launcher' {
+        $script:app.inferredProcessName = 'LineLauncher'
+        $script:app.startedProcessId = $script:window.ProcessId
+
+        Get-WindowMatchScore -Window $script:window -App $script:app -NewHandles @{ 42 = $true } -ExcludedHandles @{} | Should BeGreaterThan 0
+    }
+
+    It 'supports handles larger than Int32 without an overflow' {
+        $script:window.Handle = [long]4294967296
+
+        { Get-WindowMatchScore -Window $script:window -App $script:app -NewHandles @{} -ExcludedHandles @{} } | Should Not Throw
+    }
+
+    It 'treats shortcut titles as literal text rather than wildcard patterns' {
+        $script:app.inferredProcessName = 'launcher'
+        $script:app.preferredTitle = 'My [App]'
+        $script:window.Title = 'My [App] - Home'
+
+        Get-WindowMatchScore -Window $script:window -App $script:app -NewHandles @{} -ExcludedHandles @{} | Should BeGreaterThan 0
+        $script:window.Title = 'My A - Home'
+        Get-WindowMatchScore -Window $script:window -App $script:app -NewHandles @{} -ExcludedHandles @{} | Should Be -1
     }
 
     It 'rejects an existing window whose process name differs' {
@@ -437,6 +460,61 @@ Describe 'Invoke-DesktopLayout' {
         $results[0].Status | Should Be 'Moved'
         $results[0].Handle | Should Be 42
         $script:startCount | Should Be 1
+    }
+
+    It 'waits for a delayed new window in Launch mode without moving the old one' {
+        $script:oldWindow = [pscustomobject]@{
+            Handle = [long]7; ProcessId = 70; ProcessName = 'notepad'; Title = 'Old'; ClassName = 'Notepad'; Desktop = 'Other'; Maximized = $false
+        }
+        $script:windows = @($script:oldWindow)
+        $script:adapter.Wait = {
+            param($Milliseconds)
+            $script:now = $script:now.AddMilliseconds($Milliseconds)
+            $script:windows += [pscustomobject]@{
+                Handle = [long]42; ProcessId = 100; ProcessName = 'notepad'; Title = 'New'; ClassName = 'Notepad'; Desktop = 'Other'; Maximized = $false
+            }
+        }
+        $settings = New-OrchestrationSettings @([pscustomobject]@{ path = 'notepad'; onExisting = 'Launch' })
+
+        $results = @(Invoke-DesktopLayout -Settings $settings -Adapter $script:adapter -Log {})
+
+        $results[0].Handle | Should Be 42
+        $script:oldWindow.Desktop | Should Be 'Other'
+        $script:startCount | Should Be 1
+    }
+
+    It 'fails Launch if the application only reuses its existing window' {
+        $script:windows = @([pscustomobject]@{
+            Handle = [long]7; ProcessId = 70; ProcessName = 'notepad'; Title = 'Old'; ClassName = 'Notepad'; Desktop = 'Other'; Maximized = $false
+        })
+        $settings = New-OrchestrationSettings @([pscustomobject]@{ path = 'notepad'; onExisting = 'Launch'; timeoutSeconds = 1 })
+
+        $results = @(Invoke-DesktopLayout -Settings $settings -Adapter $script:adapter -Log {})
+
+        $results[0].Status | Should Be 'Failed'
+        $script:moveCount | Should Be 0
+    }
+
+    It 'does not fall back to an old window if the new Launch window disappears' {
+        $script:oldWindow = [pscustomobject]@{
+            Handle = [long]7; ProcessId = 70; ProcessName = 'notepad'; Title = 'Old'; ClassName = 'Notepad'; Desktop = 'Other'; Maximized = $false
+        }
+        $script:newWindow = [pscustomobject]@{
+            Handle = [long]42; ProcessId = 100; ProcessName = 'notepad'; Title = 'New'; ClassName = 'Notepad'; Desktop = 'Other'; Maximized = $false
+        }
+        $script:getWindowsCount = 0
+        $script:adapter.GetWindows = {
+            $script:getWindowsCount++
+            if ($script:getWindowsCount -eq 2) { @($script:oldWindow, $script:newWindow) }
+            else { @($script:oldWindow) }
+        }
+        $settings = New-OrchestrationSettings @([pscustomobject]@{ path = 'notepad'; onExisting = 'Launch'; timeoutSeconds = 1 })
+
+        $results = @(Invoke-DesktopLayout -Settings $settings -Adapter $script:adapter -Log {})
+
+        $results[0].Status | Should Be 'Failed'
+        $script:oldWindow.Desktop | Should Be 'Other'
+        $script:moveCount | Should Be 0
     }
 
     It 'returns failed when movement cannot be verified' {
@@ -717,6 +795,23 @@ Describe 'Invoke-DesktopLayout' {
         $results[0].Handle | Should Be 43
         $script:reusedHandleWindow.Desktop | Should Be 'Other'
         $script:replacementWindow.Desktop | Should Be 'Main'
+    }
+
+    It 'reports a failed desktop-only layout after processing other desktops' {
+        $script:requestedDesktops = @()
+        $script:adapter.GetOrCreateDesktop = {
+            param($Name)
+            $script:requestedDesktops += $Name
+            if ($Name -eq 'Broken') { throw 'creation unavailable' }
+            $script:targetDesktop
+        }
+        $settings = ConvertTo-DesktopLayoutSettings -InputObject (New-TestLayout @(
+            [pscustomobject]@{ name = 'Broken'; apps = @() },
+            [pscustomobject]@{ name = 'Main'; apps = @() }
+        ))
+
+        { Invoke-DesktopLayout -Settings $settings -Adapter $script:adapter -Log {} } | Should Throw 'creation unavailable'
+        $script:requestedDesktops.Count | Should Be 2
     }
 
     It 'honors Skip for an existing matching window' {

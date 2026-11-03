@@ -154,3 +154,80 @@ Describe 'Get-StartupEnvironmentDiagnostics' {
         ($diagnostics.PSObject.Properties.Name -contains 'VirtualDesktopModuleVersion') | Should Be $true
     }
 }
+
+Describe 'application paths and arguments' {
+    It 'resolves relative application and working paths independently of the current directory' {
+        $projectPath = Split-Path $PSScriptRoot -Parent
+        $app = New-WindowsTestApp -Path '.\Startup-VirtualDesktop.ps1'
+        $app.workingDirectory = '.\tests'
+        $adapter = New-WindowsDesktopAdapter
+        Push-Location $TestDrive
+        try {
+            $resolved = & $adapter.ResolveApplication $app
+        } finally {
+            Pop-Location
+        }
+
+        $resolved.launchPath | Should Be (Join-Path $projectPath 'Startup-VirtualDesktop.ps1')
+        $resolved.workingDirectory | Should Be (Join-Path $projectPath 'tests')
+    }
+
+    It 'expands environment variables in the working directory' {
+        $app = New-WindowsTestApp -Path 'cmd'
+        $app.workingDirectory = '%TEMP%'
+        $adapter = New-WindowsDesktopAdapter
+
+        $resolved = & $adapter.ResolveApplication $app
+
+        $resolved.workingDirectory | Should Be $env:TEMP
+    }
+
+    It 'preserves spaces empty strings quotes and trailing backslashes in child process arguments' {
+        $childPath = Join-Path $TestDrive 'argument receiver.ps1'
+        $outputPath = Join-Path $TestDrive 'received arguments.json'
+        Set-Content -LiteralPath $childPath -Value 'param([string]$OutputPath); ConvertTo-Json -InputObject @($args) -Compress | Set-Content -LiteralPath $OutputPath -Encoding utf8'
+        $expected = @('plain', 'two words', '', 'say "hello"', 'C:\space dir\', 'backslash\"quote', '日本語')
+        # Run only a hidden argument receiver; never open a configured user application.
+        Mock Start-Process -ModuleName StartupVirtualDesktop.Windows {
+            param($FilePath, $ArgumentList)
+            $startInfo = [Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $FilePath
+            $startInfo.Arguments = $ArgumentList -join ' '
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $process = [Diagnostics.Process]::Start($startInfo)
+            try {
+                if (-not $process.WaitForExit(10000)) {
+                    $process.Kill($true)
+                    throw 'Argument receiver timed out.'
+                }
+                if ($process.ExitCode -ne 0) { throw 'Argument receiver failed.' }
+                [pscustomobject]@{ Id = $process.Id }
+            } finally {
+                $process.Dispose()
+            }
+        }
+        $app = [pscustomobject]@{
+            launchPath = Join-Path $PSHOME 'pwsh.exe'
+            arguments = @('-NoProfile', '-NonInteractive', '-File', $childPath, $outputPath) + $expected
+            workingDirectory = ''
+        }
+        $adapter = New-WindowsDesktopAdapter
+
+        $null = & $adapter.StartApplication $app
+
+        $actual = @(Get-Content -LiteralPath $outputPath -Raw -Encoding utf8 | ConvertFrom-Json)
+        $actual.Count | Should Be $expected.Count
+        for ($i = 0; $i -lt $expected.Count; $i++) {
+            $actual[$i] | Should BeExactly $expected[$i]
+        }
+    }
+
+    It 'excludes the desktop and taskbars from application window candidates' {
+        $adapter = New-WindowsDesktopAdapter
+
+        $windows = @(& $adapter.GetWindows)
+
+        @($windows | Where-Object ClassName -in @('Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd')).Count | Should Be 0
+    }
+}
