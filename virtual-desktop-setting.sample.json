@@ -1,0 +1,37 @@
+{
+  "$schema": "./virtual-desktop-setting.schema.json",
+  "desktops": [
+    {
+      "name": "Main",
+      "apps": [
+        {
+          "path": "explorer.exe",
+          "timeoutSeconds": 15
+        },
+        {
+          "path": "chrome",
+          "maximized": true,
+          "windowMatch": {
+            "processName": "chrome"
+          }
+        }
+      ],
+      "wallpaperAbsolutePath": ""
+    },
+    {
+      "name": "Music",
+      "apps": [
+        {
+          "path": "C:\\Spotify.lnk",
+          "timeoutSeconds": 30,
+          "onExisting": "Move",
+          "windowMatch": {
+            "processName": "Spotify",
+            "titleRegex": "Spotify"
+          }
+        }
+      ],
+      "wallpaperAbsolutePath": "C:\\localfile\\wallpaper\\music.jpg"
+    }
+  ]
+}

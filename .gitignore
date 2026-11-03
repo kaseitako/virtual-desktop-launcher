@@ -1,0 +1,20 @@
+# Local application layouts (only the public sample and schema are tracked).
+/virtual-desktop-setting*.json
+!/virtual-desktop-setting.sample.json
+!/virtual-desktop-setting.schema.json
+/settings/
+
+# Runtime data can contain application paths and other personal information.
+/logs/
+*.jsonl
+
+# Local tools and test output.
+/.tools/
+/TestResults/
+/test-results.xml
+/.worktrees/
+/.agents/
+/.aws/
+/.codex/
+.env
+.env.*
