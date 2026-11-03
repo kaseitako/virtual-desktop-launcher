@@ -10,7 +10,7 @@
 | 対象ディレクトリ | `powershell/startup-virtual-desktop/` |
 | 移行先 | [kaseitako/virtual-desktop-launcher](https://github.com/kaseitako/virtual-desktop-launcher) |
 
-エントリースクリプト、3つのモジュール、サンプル設定、JSON Schema、既存テストをリポジトリ直下へ移植しました。起動・配置ロジックは移植元と同一です。外部依存の VirtualDesktop モジュールは同梱せず、利用者がインストールします。
+エントリースクリプト、3つのモジュール、サンプル設定、JSON Schema、既存テストをリポジトリ直下へ移植しました。移植時点の起動・配置ロジックは移植元と同一です。以後の修正はこのリポジトリのGit履歴を参照してください。外部依存の VirtualDesktop モジュールは同梱せず、利用者がインストールします。
 
 ## 公開対象の整理
 
@@ -25,7 +25,7 @@
 - PSVirtualDesktop 由来の関数について、[第三者の著作権・ライセンス表示](../THIRD_PARTY_NOTICES.md)を追加しました。プロジェクト全体のライセンスは新規に指定していません。
 - コミットの作成者情報には GitHub の公開ハンドルと noreply アドレスを使用します。
 
-## 検証結果
+## 移植時点の検証結果
 
 | 検証 | 結果 |
 |---|---|

@@ -139,7 +139,7 @@ function Test-HandleInSet {
     )
 
     return $Set.ContainsKey($Handle) -or
-        $Set.ContainsKey([int]$Handle) -or
+        ($Handle -ge [int]::MinValue -and $Handle -le [int]::MaxValue -and $Set.ContainsKey([int]$Handle)) -or
         $Set.ContainsKey([string]$Handle)
 }
 
@@ -200,11 +200,7 @@ function Get-WindowMatchScore {
         }
 
         if (-not [string]::IsNullOrWhiteSpace($inferredProcessName)) {
-            if (-not ([string]$Window.ProcessName).Equals($inferredProcessName, [System.StringComparison]::OrdinalIgnoreCase)) {
-                if (-not $isNewHandle) {
-                    return -1
-                }
-            } else {
+            if (([string]$Window.ProcessName).Equals($inferredProcessName, [System.StringComparison]::OrdinalIgnoreCase)) {
                 $score += 40
             }
         }
@@ -215,7 +211,7 @@ function Get-WindowMatchScore {
             ''
         }
         if (-not [string]::IsNullOrWhiteSpace($preferredTitle) -and
-            [string]$Window.Title -like "*$preferredTitle*") {
+            ([string]$Window.Title).IndexOf($preferredTitle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
             $score += 20
         }
 
@@ -229,12 +225,13 @@ function Get-WindowMatchScore {
         }
     }
 
-    if ($isNewHandle) {
-        $score += 50
-    }
-
+    # A new handle alone does not identify an application (especially at logon).
     if ($score -eq 0) {
         return -1
+    }
+
+    if ($isNewHandle) {
+        $score += 50
     }
 
     return $score
@@ -337,20 +334,24 @@ function Update-ApplicationWindowSelection {
         [object[]]$Windows,
 
         [Parameter(Mandatory)]
-        [hashtable]$AssignedHandles
+        [hashtable]$AssignedHandles,
+
+        [Parameter(Mandatory)]
+        [hashtable]$ExcludedHandles
     )
 
     $selectedHandle = [long]$SelectedWindow.Handle
     foreach ($window in @($Windows)) {
         if ([long]$window.Handle -eq $selectedHandle -and
-            [int]$window.ProcessId -eq [int]$SelectedWindow.ProcessId) {
+            [int]$window.ProcessId -eq [int]$SelectedWindow.ProcessId -and
+            (Get-WindowMatchScore -Window $window -App $App -NewHandles @{} -ExcludedHandles $ExcludedHandles) -ge 0) {
             $AssignedHandles[[string]$selectedHandle] = $true
             return $window
         }
     }
 
     $null = $AssignedHandles.Remove([string]$selectedHandle)
-    $replacement = Get-BestApplicationWindow -App $App -Windows @($Windows) -ExcludedHandles $AssignedHandles
+    $replacement = Get-BestApplicationWindow -App $App -Windows @($Windows) -ExcludedHandles $ExcludedHandles
     if ($null -ne $replacement) {
         $AssignedHandles[[string][long]$replacement.Handle] = $true
     }
@@ -484,6 +485,7 @@ function Invoke-DesktopLayout {
             try {
                 $app = & $resolveApplication $configuredApp
                 $windowsBeforeLaunch = @(& $getWindows)
+                $excludedHandles = $assignedHandles.Clone()
                 $existingWindow = $null
                 if ($app.onExisting -ne 'Launch') {
                     $existingWindow = Get-BestApplicationWindow -App $app -Windows $windowsBeforeLaunch -ExcludedHandles $assignedHandles
@@ -503,6 +505,9 @@ function Invoke-DesktopLayout {
                     $beforeHandles = @{}
                     foreach ($beforeWindow in $windowsBeforeLaunch) {
                         $beforeHandles[[string][long]$beforeWindow.Handle] = $true
+                        if ($app.onExisting -eq 'Launch') {
+                            $excludedHandles[[string][long]$beforeWindow.Handle] = $true
+                        }
                     }
 
                     $launchInfo = & $startApplication $app
@@ -514,7 +519,7 @@ function Invoke-DesktopLayout {
                         }
                     }
 
-                    $window = Wait-ApplicationWindow -App $app -Adapter $Adapter -BeforeHandles $beforeHandles -ExcludedHandles $assignedHandles
+                    $window = Wait-ApplicationWindow -App $app -Adapter $Adapter -BeforeHandles $beforeHandles -ExcludedHandles $excludedHandles
                     if ($null -eq $window) {
                         throw "Timed out after $($app.timeoutSeconds) seconds waiting for an application window."
                     }
@@ -527,7 +532,7 @@ function Invoke-DesktopLayout {
                 $placementError = $null
                 for ($placementAttempt = 1; $placementAttempt -le $placementAttemptLimit; $placementAttempt++) {
                     $previousWindow = $window
-                    $currentWindow = Update-ApplicationWindowSelection -App $app -SelectedWindow $window -Windows @(& $getWindows) -AssignedHandles $assignedHandles
+                    $currentWindow = Update-ApplicationWindowSelection -App $app -SelectedWindow $window -Windows @(& $getWindows) -AssignedHandles $assignedHandles -ExcludedHandles $excludedHandles
 
                     if ($null -eq $currentWindow) {
                         $placementError = [System.InvalidOperationException]::new('Application window disappeared before placement.')
@@ -591,6 +596,13 @@ function Invoke-DesktopLayout {
                 $results.Add($result)
                 Write-DesktopLayoutLog -Log $Log -Level 'Error' -Message 'Application reconciliation failed.' -Data $result
             }
+        }
+    }
+
+    # Desktop-only layouts must also report a failed creation to the caller.
+    foreach ($desktop in @($Settings.desktops)) {
+        if ($desktopErrors.ContainsKey($desktop.name) -and @($desktop.apps).Count -eq 0) {
+            throw "Desktop '$($desktop.name)' creation failed: $($desktopErrors[$desktop.name])"
         }
     }
 
