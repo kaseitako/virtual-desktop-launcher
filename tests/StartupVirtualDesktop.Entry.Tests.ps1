@@ -13,25 +13,43 @@ function Invoke-EntryScriptProcess {
         [string]$EntryScriptPath = $script:scriptPath
     )
 
-    $id = [guid]::NewGuid().ToString('N')
-    $standardOutput = Join-Path $TestDrive "$id.stdout.txt"
-    $standardError = Join-Path $TestDrive "$id.stderr.txt"
-    $arguments = @(
-        '-NoLogo', '-NoProfile', '-File', ('"{0}"' -f $EntryScriptPath),
-        '-LogDirectory', ('"{0}"' -f $LogDirectory),
-        '-ValidateOnly'
-    )
+    # A child process can default to an OEM code page on non-Japanese Windows.
+    # Set both ends to UTF-8 so Japanese assertions survive output redirection.
+    $quotedScript = "'" + $EntryScriptPath.Replace("'", "''") + "'"
+    $quotedLogDirectory = "'" + $LogDirectory.Replace("'", "''") + "'"
+    $command = '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ' +
+        "& $quotedScript -LogDirectory $quotedLogDirectory -ValidateOnly"
     if (-not [string]::IsNullOrWhiteSpace($SettingsPath)) {
-        $arguments += @('-SettingsPath', ('"{0}"' -f $SettingsPath))
+        $quotedSettings = "'" + $SettingsPath.Replace("'", "''") + "'"
+        $command += " -SettingsPath $quotedSettings"
     }
-    $process = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -ArgumentList $arguments -Wait -PassThru -RedirectStandardOutput $standardOutput -RedirectStandardError $standardError
-    $redirectEncoding = [Console]::OutputEncoding
-    $standardOutputText = $redirectEncoding.GetString([IO.File]::ReadAllBytes($standardOutput))
-    $standardErrorText = $redirectEncoding.GetString([IO.File]::ReadAllBytes($standardError))
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = Join-Path $PSHOME 'pwsh.exe'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $startInfo.StandardErrorEncoding = [Text.Encoding]::UTF8
+    foreach ($argument in @('-NoLogo', '-NoProfile', '-OutputFormat', 'Text', '-EncodedCommand', $encodedCommand)) {
+        $startInfo.ArgumentList.Add($argument)
+    }
 
-    [pscustomobject]@{
-        ExitCode = $process.ExitCode
-        Output = $standardOutputText + $standardErrorText
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        $null = $process.Start()
+        $outputTask = $process.StandardOutput.ReadToEndAsync()
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+
+        [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Output = $outputTask.GetAwaiter().GetResult() + $errorTask.GetAwaiter().GetResult()
+        }
+    } finally {
+        $process.Dispose()
     }
 }
 
@@ -63,7 +81,7 @@ Describe 'Startup-VirtualDesktop.ps1' {
     It 'uses the default settings path when SettingsPath is omitted' {
         $logDirectory = Join-Path $TestDrive 'default-settings-logs'
         # Keep the caller's personal settings out of the test run.
-        $fixturePath = Join-Path $TestDrive 'standalone launcher'
+        $fixturePath = Join-Path $TestDrive "standalone launcher's folder"
         $null = New-Item -ItemType Directory -Path $fixturePath
         Copy-Item -LiteralPath $scriptPath -Destination $fixturePath
         Copy-Item -LiteralPath (Join-Path $projectPath 'modules') -Destination $fixturePath -Recurse

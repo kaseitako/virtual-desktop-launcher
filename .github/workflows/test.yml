@@ -12,7 +12,9 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Download test dependency
         shell: pwsh
         run: Save-Module Pester -RequiredVersion 4.10.1 -Path ./.tools -Repository PSGallery -Force
